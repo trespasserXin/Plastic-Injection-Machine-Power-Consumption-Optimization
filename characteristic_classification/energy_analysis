@@ -1,0 +1,359 @@
+import pandas as pd
+from run_split import get_run_info, get_order, split_normal
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+import matplotlib.cbook as cbook
+from scipy.stats import shapiro, levene, mannwhitneyu
+from cliffs_delta import cliffs_delta
+SCREW_THRE = 4
+
+run_info, df = get_run_info("datav2")
+run_orders_df = get_order(df, run_info)
+# run_info_df = np.transpose(run_info_)
+# run_info_df = pd.DataFrame(run_info_df, columns=["Start Index",  "End Index", "Run Duration (Whole Run)",
+#                                                  "Run ID"])
+# run_info_df.to_csv("run_info_.csv", index=False)
+# normal_run, unnormal_run = split_normal(run_orders_df)
+def startup_energy(run_orders, run_info_, run_df):
+    power_dict = {"Energy":[], "Status":[], "Length":[]}
+
+    for run in run_info_[-1, :]:
+        if run_orders[["Therm", "Barrel", "Motor"]].sum(axis=1).at[run-1] < 0:
+
+            power_dict["Energy"].append(0)
+            power_dict["Status"].append("No Production")
+            power_dict["Length"].append(0)
+            continue
+
+        start = run_info_[0, run-1]+1
+        end = run_info_[1, run-1]
+
+        screw_motor = run_df.loc[start:end, "201 Screw Retraction Motor   (kW)"]
+        screw_status = (screw_motor > SCREW_THRE).astype(int)
+        if screw_status.sum() == 0:
+            power_dict["Energy"].append(0)
+            power_dict["Status"].append("All Idle")
+            power_dict["Length"].append(0)
+            continue
+        try:
+            startphase_end =  screw_status.loc[screw_status==1].index[0]
+        except IndexError:
+            print(run_df.loc[run_info_[0, run-1], "Time stamp"])
+
+        power = run_df.loc[start: startphase_end-1].select_dtypes("float").to_numpy().sum()
+        run_len = startphase_end-start+1
+        # print(power)
+        power_dict["Energy"].append(power*0.25)
+        power_dict["Status"].append("Ordinary")
+        power_dict["Length"].append(run_len*0.25)
+
+
+    run_orders["Energy"] = power_dict["Energy"]
+    run_orders["Status"] = power_dict["Status"]
+    run_orders["Length"] = power_dict["Length"]
+    return run_orders
+
+def normal_energy(normals, run_info_, run_df, run_energy_df):
+    e_dict = {"Average Power":[], "Energy":[], "Idle Length":[], "Run Type":[], "Run ID":[]}
+    for run in normals["Run ID"]:
+
+        idx = np.argwhere(run_info_[-1,:] == run).squeeze()
+        # print(run_df.loc[run_info_[0, idx], "Time stamp"])
+        start = run_info_[0, idx]+1
+        end = run_info_[1, idx]
+
+        motor_status = (run_df.loc[start:end, "201 Motor 1   (kW)"]>1).astype(int)
+        screw_motor = run_df.loc[start:end, "201 Screw Retraction Motor   (kW)"]
+        screw_status = (screw_motor > SCREW_THRE).astype(int)
+        if motor_status.sum() == 0:
+            continue
+        motor_start = motor_status.loc[motor_status == 1].index[0]
+        screw_start = screw_status.loc[screw_status == 1].index[0]
+        idle_len = screw_start - motor_start
+
+        if abs(idle_len) <= 1:
+            e_dict["Run Type"].append("No Idle")
+            idle_len = abs(idle_len)
+        else:
+            e_dict["Run Type"].append("Idle")
+
+        normal_p = (run_energy_df.loc[run_energy_df["Run ID"] == run, "Energy"] /
+                    run_energy_df.loc[run_energy_df["Run ID"] == run, "Length"])
+        e = run_energy_df.loc[run_energy_df["Run ID"] == run, "Energy"]
+        # print(type(normal_p.to_numpy().squeeze()))
+        e_dict["Average Power"].append(normal_p.to_numpy().squeeze().item())
+        e_dict["Idle Length"].append(idle_len)
+        e_dict["Run ID"].append(run)
+        e_dict["Energy"].append(e.to_numpy().squeeze().item())
+
+    normal_e_df = pd.DataFrame(e_dict)
+    return normal_e_df
+
+def energy_diff(run_e):
+    run_e = run_e[run_e["Status"] == "Ordinary"]
+    normal_masks = (run_e["Barrel"] == run_e["Therm"]) & (run_e["Motor"] > 1)
+
+    normal_run_e = (run_e.loc[normal_masks, "Energy"]).mean()
+    unnormal_run_e = (run_e.loc[~normal_masks, "Energy"]).mean()
+
+    diff = unnormal_run_e-normal_run_e
+    return diff
+
+def run_p_visual(data):
+    summary = data.groupby('Run Type')['Average Power'].agg(
+        count='size',
+        mean='mean',
+        std='std',
+        median='median',
+        q25 = lambda s: s.quantile(0.25),
+        q75 = lambda s: s.quantile(0.75)
+    )
+    print(summary)
+
+    # 2a. Overlayed kernel‐density estimate
+    sns.kdeplot(data=data, x='Average Power', hue='Run Type', common_norm=False)
+    plt.title('Power distribution on Normal vs Non-Normal Runs')
+    plt.show()
+
+    # 2b. Box/violin plot
+    sns.boxplot(data=data, x='Run Type', y='Average Power')
+    plt.title('Power by Run Type')
+    plt.show()
+
+    # Decide Statistical Test
+
+    normal = shapiro(data.loc[data["Run Type"] == "Normal", 'Average Power'])
+    unnormal = shapiro(data.loc[data["Run Type"] == "Unnormal", 'Average Power'])
+    var_equal = levene(data.loc[data["Run Type"]=="Normal",'Average Power'],
+                       data.loc[data["Run Type"]=="Unnormal",'Average Power'])
+
+    print('Shapiro p-normal:', normal.pvalue, unnormal.pvalue)
+    print('Levene equal-var p:', var_equal.pvalue)
+
+    # Use — Mann-Whitney U — for non-normal data
+    normal_run = data.loc[data["Run Type"] == "Normal", 'Average Power']
+    unnormal_run = data.loc[data["Run Type"] == "Unnormal", 'Average Power']
+    u_stat, p_u = mannwhitneyu(normal_run, unnormal_run, alternative="two-sided")
+    print('p-value for MannWhitneyU:', p_u)
+
+    # Quantify effect size (how big the difference)
+    delta, _ = cliffs_delta(normal_run, unnormal_run)
+    print("Cliff's delta:", delta)
+
+def run_e_visual(data):
+
+    e_df = data
+    summary = e_df.groupby('Run Type')['Energy'].agg(
+        count='size',
+        mean='mean',
+        std='std',
+        median='median',
+        q25=lambda s: s.quantile(0.25),
+        q75=lambda s: s.quantile(0.75)
+    )
+    print(summary)
+
+    # 2a. Overlayed kernel‐density estimate
+    sns.kdeplot(data=e_df, x='Energy', hue='Run Type', common_norm=False)
+    plt.title('Energy distribution on Normal vs Non-Normal Runs')
+    plt.show()
+
+    # 2b. Box/violin plot
+    sns.boxplot(data=e_df, x='Run Type', y='Energy', showfliers=False)
+    plt.title('Energy by Run Type')
+    plt.show()
+
+    # Decide Statistical Test
+
+    normal = shapiro(e_df.loc[e_df["Run Type"] == "Normal", 'Energy'])
+    unnormal = shapiro(e_df.loc[e_df["Run Type"] == "Unnormal", 'Energy'])
+    var_equal = levene(e_df.loc[e_df["Run Type"] == "Normal", 'Energy'],
+                       e_df.loc[e_df["Run Type"] == "Unnormal", 'Energy'])
+
+    print('Shapiro p-normal:', normal.pvalue, unnormal.pvalue)
+    print('Levene equal-var p:', var_equal.pvalue)
+
+    # Use — Mann-Whitney U — for non-normal data
+    normal_run = e_df.loc[e_df["Run Type"] == "Normal", 'Energy']
+    unnormal_run = e_df.loc[e_df["Run Type"] == "Unnormal", 'Energy']
+    u_stat, p_u = mannwhitneyu(normal_run, unnormal_run, alternative="two-sided")
+    print('p-value for MannWhitneyU:', p_u)
+
+    # Quantify effect size (how big the difference)
+    delta, _ = cliffs_delta(normal_run, unnormal_run)
+    print("Cliff's delta:", delta)
+    return e_df
+
+def normal_p_visual(data):
+    summary = data.groupby('Run Type')['Average Power'].agg(
+        count='size',
+        mean='mean',
+        std='std',
+        median='median',
+        q25=lambda s: s.quantile(0.25),
+        q75=lambda s: s.quantile(0.75)
+    )
+    print(summary)
+
+    sns.kdeplot(data=data, x='Average Power', hue='Run Type', common_norm=False)
+    plt.title('Power distribution within Normal Runs')
+    plt.show()
+
+    sns.boxplot(data=data, x='Run Type', y='Average Power')
+    plt.title('Power by Idle Status')
+    plt.show()
+
+def normal_e_visual(data):
+
+    summary = data.groupby('Run Type')['Energy'].agg(
+        count='size',
+        mean='mean',
+        std='std',
+        median='median',
+        q25=lambda s: s.quantile(0.25),
+        q75=lambda s: s.quantile(0.75)
+    )
+    print(summary)
+
+    sns.kdeplot(data=data, x='Energy', hue='Run Type', common_norm=False)
+    plt.title('Energy distribution within Normal Runs')
+    plt.show()
+
+    sns.boxplot(data=data, x='Run Type', y='Energy')
+    plt.title('Energy by Idle Status')
+    plt.show()
+
+def plot_percentiles(data_all, run_info_, run_df, r_type, d_type):
+    data = data_all.loc[data_all["Run Type"] == r_type]
+
+    q25, median, q75 = data[data["Run Type"] == r_type][d_type].quantile([0.25, 0.5, 0.75])
+    run_25 = data.loc[(data[d_type] - q25).abs().idxmin(), "Run ID"]
+    run_50 = data.loc[(data[d_type] - median).abs().idxmin(), "Run ID"]
+    run_75 = data.loc[(data[d_type] - q75).abs().idxmin(), "Run ID"]
+    # print(run_25, run_50, run_75)
+
+    plot_id = [np.where(run_info_[-1,:] == v)[0][0] for v in [run_25, run_50, run_75]]
+    # print(plot_id)
+    titles = [f"25th Percentile {d_type} {r_type} Plot", f"Median {d_type} {r_type} Plot",
+              f"75th Percentile {d_type} {r_type} Plot"]
+
+    for title, r_id in zip(titles, plot_id):
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=[14,6])
+
+        start = run_info_[0, r_id]
+        end = run_info_[1, r_id]
+        # print(run_df.loc[start, 'Time stamp'])
+        plot_df = run_df.loc[start: end]
+        screw_motor = plot_df["201 Screw Retraction Motor   (kW)"]
+        screw_status = (screw_motor > SCREW_THRE).astype(int)
+        startphase_end = screw_status.loc[screw_status == 1].index[0]
+        start_df = plot_df.loc[:startphase_end]
+        plot_df.plot(x = 'Time stamp', ax = ax1, legend=False)
+        start_df.plot(x = 'Time stamp', ax = ax2, legend=False)
+        handles0, labels0 = ax1.get_legend_handles_labels()
+        # handles1, labels1 = ax2.get_legend_handles_labels()
+        all_handles = handles0
+        all_labels = labels0
+        fig.subplots_adjust(right=0.75)
+        fig.legend(all_handles, all_labels, bbox_to_anchor=(0.86, 1), loc='upper center', ncol=1)
+
+        fig.suptitle(title, fontsize=18)
+        path = f"Energy Analysis/figures/{title}.png"
+        fig.savefig(path, dpi=300, bbox_inches='tight')
+        plt.close(fig)  # close it so it doesn’t hang around
+
+
+def extract_idle(normals, run_df, run_info_):
+    idle_df = normals[["Run ID", "Idle Length"]]
+    idle_df["Idle Length"] = idle_df["Idle Length"]*0.25
+    idle_dict = {"Idle Energy":[], "Start Idx":[], "End Idx":[]}
+    for run in normals["Run ID"]:
+        idx = np.argwhere(run_info_[-1, :] == run).squeeze()
+        # print(run_df.loc[run_info_[0, idx], "Time stamp"])
+        start = run_info_[0, idx] + 1
+        end = run_info_[1, idx]
+
+        motor_status = (run_df.loc[start:end, "201 Motor 1   (kW)"] > 1).astype(int)
+        screw_motor = run_df.loc[start:end, "201 Screw Retraction Motor   (kW)"]
+        screw_status = (screw_motor > SCREW_THRE).astype(int)
+        # if motor_status.sum() == 0:
+        #     continue
+        motor_start = motor_status.loc[motor_status == 1].index[0]
+        screw_start = screw_status.loc[screw_status == 1].index[0]
+        idle_len = (screw_start - motor_start)*0.25
+        idle_power = run_df.loc[motor_start: screw_start-1].select_dtypes(float).to_numpy().sum()
+        idle_e = idle_power * 0.25
+
+        idle_dict["Idle Energy"].append(idle_e)
+        idle_dict["Start Idx"].append(motor_start)
+        idle_dict["End Idx"].append(screw_start)
+
+    idle_df2 = pd.DataFrame(idle_dict)
+    idle_df = pd.concat([idle_df, idle_df2], axis=1)
+    print(idle_df.head(20))
+
+    return idle_df
+
+
+run_energy = startup_energy(run_orders_df, run_info, df)
+
+
+p = (run_energy.loc[run_energy["Status"] == "Ordinary", "Energy"] /
+     run_energy.loc[run_energy["Status"] == "Ordinary", "Length"])
+run_type = ((run_energy["Barrel"] == run_energy["Therm"]) & (run_energy["Motor"] > 1) &
+            (run_energy["Status"] == "Ordinary")).astype(int)
+run_id = run_energy.loc[run_energy["Status"] == "Ordinary", "Run ID"]
+energy = run_energy.loc[run_energy["Status"] == "Ordinary", "Energy"]
+
+run_type.loc[run_type[run_type==1].index] = "Normal"
+run_type.loc[run_type[run_type==0].index] = "Unnormal"
+
+production_df = pd.DataFrame(data={"Average Power":p, "Energy": energy,
+                                   "Run Type":run_type, "Run ID":run_id})
+production_df = production_df.dropna(axis=0, how="any", ignore_index=True)
+
+normal_run, unnormal_run = split_normal(run_energy[run_energy["Status"]=="Ordinary"])
+
+normal_split = normal_energy(normal_run, run_info, df, run_energy)
+
+e_diff = energy_diff(run_energy)
+print("Average Energy Difference for Normal vs Non-Normal Runs:", e_diff)
+
+print(production_df.shape)
+print(production_df["Energy"].to_numpy().sum())
+# extracted = extract_idle(normal_split, df, run_info_)
+# extracted.to_csv("normal_df.csv")
+
+"""
+Visualizations:
+"""
+
+# run_p_visual(production_df)
+# normal_p_visual(normal_split)
+# energys = run_e_visual(production_df)
+# normal_e_visual(normal_split)
+
+# print(df.loc[run_info_[0, int(energys.loc[energys["Energy"].idxmax(), "Run ID"])-1],"Time stamp"])
+plot_percentiles(production_df, run_info, df, "Normal", "Average Power")
+plot_percentiles(production_df, run_info, df, "Normal", "Energy")
+plot_percentiles(normal_split, run_info, df, "Idle", "Energy")
+plot_percentiles(normal_split, run_info, df, "Idle", "Average Power")
+plot_percentiles(normal_split, run_info, df, "No Idle", "Average Power")
+plot_percentiles(normal_split, run_info, df, "No Idle", "Energy")
+plot_percentiles(production_df, run_info, df, "Unnormal", "Average Power")
+plot_percentiles(production_df, run_info, df, "Unnormal", "Energy")
+
+# get stats dict for your data
+# stats = cbook.boxplot_stats(energys.loc[energys["Run Type"] == "Unnormal", 'Energy'])
+#
+# # stats is a list (one element per “box”)
+# # each element is a dict with keys 'medians','q1','q3','fliers', etc.
+# fliers = stats[0]['fliers']
+#
+# print(fliers)               # list of outlier values
+# # if you also need indices, you can match them back:
+# indices = energys['Energy'][energys['Energy'].isin(fliers)].index.tolist()
+# print(indices)
+# for idx in indices:
+#     print(df.loc[run_info_[0, int(energys.loc[idx, "Run ID"]) - 1], "Time stamp"])

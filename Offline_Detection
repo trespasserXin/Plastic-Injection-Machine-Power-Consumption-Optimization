@@ -1,0 +1,64 @@
+from Utils import get_start_end
+import pandas as pd
+import numpy as np
+SCREW_THRE = 5
+def get_screw_idle(folder_path, min_len):
+    """
+    This function yields the idle periods using the screw motor method(i.e. identify periods where
+    the screw motor is under a certain threshold, but the motor is on)
+    :param folder_path:1 min M201 data
+    :param min_len: the length of a valid idle period should be larger than this value
+    :return: 2*N numpy array, each row is a start and end index of an identified idle period
+    """
+    df = pd.read_csv(folder_path)
+
+    run_info = get_start_end(df['201 Barrel Heat  Secondary   (kW)'].copy(),
+                             1, False, interval=1, zero_run_len=min_len)
+    # print(run_info[:2, :5])
+    run_info[0, :] = run_info[0, :] + 1
+    idle_periods = []
+
+
+    for run in run_info[-1, :]:
+        run_start = run_info[0, run-1]
+        run_end = run_info[1, run-1]
+        run_slice = df.loc[run_start:run_end].copy()
+        run_slice['Motor Sum'] = df[["201 Motor 1   (kW)", "201 Motor 2   (kW)",
+                              "201 motor 3   (kW)"]].sum(axis=1)
+        screw_status = (run_slice['201 Screw Retraction Motor   (kW)'] > SCREW_THRE).astype(int)
+        motor_on = (run_slice['Motor Sum'] > 3).astype(int)
+        # motor_idle = ((118.6 < run_slice['Motor Sum']) & ( run_slice['Motor Sum'] < 137)).astype(int)
+
+        status_df = pd.DataFrame({'Screw': screw_status, 'Motor': motor_on})
+        # status_df.rename(columns={'201 Screw Retraction Motor   (kW)': 'Screw', 'Motor Sum': 'Motor'}, inplace=True)
+        status_df['Idle'] = ((status_df['Screw'] == 0) & (status_df['Motor'] == 1))
+
+        # 1) tag each “block” of same flag value
+        blocks = (status_df['Idle'] != status_df['Idle'].shift()).astype(int).cumsum()
+
+        # 2) for each block, record its start, end, length and whether it’s True
+        idle_slices = (
+            status_df
+            .groupby(blocks)['Idle']
+            .agg(
+                start_idx=lambda s: s.index[0],
+                end_idx=lambda s: s.index[-1],
+                length='size',
+                is_true='first'
+            )
+        )
+
+        # 3) filter to only True‐blocks of length ≥10, then select start/end
+        result = idle_slices.loc[idle_slices.is_true & (idle_slices.length >= min_len),
+                                                                    ['start_idx', 'end_idx']]
+        idle_periods.extend(np.array(result).flatten())
+        # print(result.head())
+
+    idle_periods = np.array(idle_periods).reshape((-1,2))
+    # idle_periods = pd.DataFrame(idle_periods, columns=['start_idx', 'end_idx'])
+    return idle_periods
+
+if __name__ == "__main__":
+#     idle_periods.to_csv('C:\\Users\\tresp\\Desktop\\Calculation\\Magna\\1min_data\\201_idles.csv')
+    get_screw_idle('C:\\Users\\tresp\\Desktop\\Calculation\\Magna\\merged_data\\201_1min.csv',
+                   15)

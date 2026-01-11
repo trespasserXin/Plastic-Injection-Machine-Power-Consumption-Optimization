@@ -261,6 +261,7 @@ class OnlineIdleDetector:
               lowvar_periods: list[(start_idx, end_idx, length_samples)] that END in this batch
               state: OnlineIdleDetectorState
         """
+        print("Batch Processing...")
         st = state or OnlineIdleDetectorState()
         s_raw_batch = _to_series(batch, value_col=value_col)
         s_raw_batch = s_raw_batch[~s_raw_batch.index.duplicated(keep="last")].sort_index()
@@ -363,7 +364,9 @@ class OnlineIdleDetector:
             else:
                 if st.lowvar_in_run:
                     # Close on the last True; at batch start use the previous batch's last index
-                    end_idx = prev_idx if prev_idx is not None else (st.prev_batch_last_idx if st.prev_batch_last_idx is not None else st.lowvar_open_start)
+                    end_idx = prev_idx if prev_idx is not None else (st.prev_batch_last_idx if
+                                                                     st.prev_batch_last_idx is not None else
+                                                                     st.lowvar_open_start)
                     total_len = st.lowvar_len_so_far
                     if total_len >= self.min_len:
                         if self.on_lowvar_end:

@@ -1,4 +1,4 @@
-from __future__ import annotations
+# from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Optional, List, Tuple, Any
 from collections import deque
@@ -111,6 +111,8 @@ class OnlineIdleDetectorState:
     lowvar_len_so_far: int = 0                # cumulative samples across batches
     lowvar_open_id: int | None = None
     lowvar_start_notified: bool = False
+
+    email_len: int = 0
 
     # EMA seed for tiny batches
     ema_last: float | None = None
@@ -261,7 +263,7 @@ class OnlineIdleDetector:
               lowvar_periods: list[(start_idx, end_idx, length_samples)] that END in this batch
               state: OnlineIdleDetectorState
         """
-        print("Batch Processing...")
+        print("Processing Batch...")
         st = state or OnlineIdleDetectorState()
         s_raw_batch = _to_series(batch, value_col=value_col)
         s_raw_batch = s_raw_batch[~s_raw_batch.index.duplicated(keep="last")].sort_index()
@@ -345,6 +347,8 @@ class OnlineIdleDetector:
                         st.lowvar_len_so_far = 1
                 else:
                     st.lowvar_len_so_far += 1
+                    if st.lowvar_len_so_far > st.email_len:
+                        st.email_len = st.lowvar_len_so_far
 
                 # Fire START once on first reach of min_len (in this or previous batch)
                 if (not st.lowvar_start_notified) and (st.lowvar_len_so_far >= self.min_len):
@@ -364,9 +368,7 @@ class OnlineIdleDetector:
             else:
                 if st.lowvar_in_run:
                     # Close on the last True; at batch start use the previous batch's last index
-                    end_idx = prev_idx if prev_idx is not None else (st.prev_batch_last_idx if
-                                                                     st.prev_batch_last_idx is not None else
-                                                                     st.lowvar_open_start)
+                    end_idx = prev_idx if prev_idx is not None else (st.prev_batch_last_idx if st.prev_batch_last_idx is not None else st.lowvar_open_start)
                     total_len = st.lowvar_len_so_far
                     if total_len >= self.min_len:
                         if self.on_lowvar_end:
@@ -379,6 +381,8 @@ class OnlineIdleDetector:
                                 context=self.context,
                             )
                         lowvar_periods.append((st.lowvar_open_start, end_idx, total_len))
+                    # Before reset, make sure the length is recorded
+                    # st.email_len = st.lowvar_len_so_far
                     # reset low-var state
                     st.lowvar_in_run = False
                     st.lowvar_open_start = None
@@ -387,6 +391,7 @@ class OnlineIdleDetector:
                     st.lowvar_start_notified = False
             prev_idx = idx_i
 
+        # st.email_len = st.lowvar_len_so_far if st.lowvar_in_run else 0
         # 5) Update tails & boundary bookkeeping
         self._update_tail(s_raw_full, s_clean_full, st)
         st.prev_batch_last_idx = batch_last_idx
